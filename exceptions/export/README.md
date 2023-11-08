@@ -7,6 +7,7 @@ Export the list of ignore rules made by an organization in FOSSA
 ### Pre-requisites
 
 - Ensure you have your [full access API token](https://docs.fossa.com/docs/api-reference) from FOSSA.
+- Ensure python is installed as well.
 
 ### How to run
 
