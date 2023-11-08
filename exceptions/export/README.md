@@ -22,7 +22,7 @@ Here's a way to run the export and output a csv file:
 | access_token | FOSSA Full Access API token |
 | `--category`  | Default is `licensing`. Another option is `security`  |
 | `--count`  |  Default is `1000 `. Number of exceptions per page |
-| `output`  | Defuault is json. Another option is `csv`  |
+| `--output`  | Defuault is json. Another option is `csv`  |
 
 
 ### Support
