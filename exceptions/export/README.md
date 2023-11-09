@@ -28,3 +28,5 @@ Here's a way to run the export and output a csv file:
 ### Support
 
 Contact your dedicated customer success team at FOSSA. If you don't have one, then please contact support@fossa.com, and give as much details as possible in terms of feedback/issues.
+
+Ignore rules API: [https://docs.fossa.com/reference/getissueexceptions](https://docs.fossa.com/reference/getissueexceptions)
