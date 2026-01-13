@@ -10,6 +10,9 @@ These tools help you:
 3. Run FOSSA analysis and assign the project to a team
 4. Handle new repositories being added to FOSSA
 
+<img width="1380" height="951" alt="image" src="https://github.com/user-attachments/assets/c71f9a50-1be0-4ab9-a312-bd5dbaf410de" />
+
+
 ## Available Tools
 
 ### 1. GitHub Action Workflow
