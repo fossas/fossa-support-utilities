@@ -1,0 +1,117 @@
+name: FOSSA Team Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      team_name:
+        description: 'Team name to assign the project to'
+        required: true
+        type: string
+      fossa_endpoint:
+        description: 'FOSSA endpoint URL (e.g., https://app.fossa.com)'
+        required: false
+        type: string
+        default: 'https://app.fossa.com'
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  FOSSA_API_KEY: ${{ secrets.FOSSA_API_KEY }}
+  TEAM_NAME: ${{ inputs.team_name || github.repository_owner }}
+  FOSSA_ENDPOINT: ${{ inputs.fossa_endpoint || 'https://app.fossa.com' }}
+
+jobs:
+  fossa-analyze-with-team:
+    name: FOSSA Analysis with Team Management
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify FOSSA API key
+        run: |
+          if [ -z "$FOSSA_API_KEY" ]; then
+            echo "Error: FOSSA_API_KEY secret is not set"
+            exit 1
+          fi
+          echo "✅ FOSSA API key is configured"
+
+      - name: Check if team exists
+        id: check_team
+        run: |
+          echo "Checking if team '$TEAM_NAME' exists..."
+
+          response=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $FOSSA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            "$FOSSA_ENDPOINT/api/teams")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" != "200" ]; then
+            echo "Error: Failed to fetch teams (HTTP $http_code)"
+            echo "Response: $body"
+            exit 1
+          fi
+
+          # Check if team exists by name
+          team_exists=$(echo "$body" | jq -r --arg name "$TEAM_NAME" '.[] | select(.name == $name) | .name' | head -n 1)
+
+          if [ -n "$team_exists" ]; then
+            echo "team_exists=true" >> $GITHUB_OUTPUT
+            echo "✅ Team '$TEAM_NAME' already exists"
+          else
+            echo "team_exists=false" >> $GITHUB_OUTPUT
+            echo "⚠️  Team '$TEAM_NAME' does not exist, will create it"
+          fi
+
+      - name: Create team if needed
+        if: steps.check_team.outputs.team_exists == 'false'
+        run: |
+          echo "Creating team '$TEAM_NAME'..."
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer $FOSSA_API_KEY" \
+            -H "Content-Type: application/json" \
+            -H "Accept: application/json" \
+            -d "{\"name\":\"$TEAM_NAME\",\"autoAddUsers\":false}" \
+            "$FOSSA_ENDPOINT/api/teams")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+            echo "Error: Failed to create team (HTTP $http_code)"
+            echo "Response: $body"
+            exit 1
+          fi
+
+          team_id=$(echo "$body" | jq -r '.id')
+          echo "✅ Team '$TEAM_NAME' created successfully (ID: $team_id)"
+
+      - name: Install FOSSA CLI
+        run: |
+          curl -H 'Cache-Control: no-cache' https://raw.githubusercontent.com/fossas/fossa-cli/master/install-latest.sh | bash
+
+      - name: Run FOSSA analysis with team assignment
+        run: |
+          echo "Running FOSSA analysis and assigning to team '$TEAM_NAME'..."
+          fossa analyze --team "$TEAM_NAME"
+          echo "✅ FOSSA analysis completed"
+
+      - name: Run FOSSA test
+        run: |
+          echo "Running FOSSA test for license and vulnerability checks..."
+          fossa test
+          echo "✅ FOSSA test completed"
+
+      - name: Get project details
+        if: always()
+        run: |
+          echo "Project analyzed and assigned to team '$TEAM_NAME'"
+          echo "View results at: $FOSSA_ENDPOINT"
