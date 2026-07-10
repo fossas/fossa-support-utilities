@@ -1,48 +1,104 @@
 #!/usr/bin/env python3
-"""Turn FOSSA snippet licensing issues into a Jira-ready JSON payload, applying walk_all.py's
-import-statement filter as the FINAL filter so only true-positive copied blocks survive.
+"""Self-contained: paginate FOSSA snippet licensing issues, classify each issue's snippet
+in-line (import-statement filter + contiguous-LoC), and emit a Jira-ready JSON payload of the
+true-positive copied blocks. No dependency on walk_all.py or any pre-built snippet dump.
 
-Pipeline:
-  1. Collect snippet licensing issues -- either by paginating the live FOSSA issues endpoint
-     (the same request the FOSSA UI makes: category=licensing, status=active,
-     scope[type]=global, filter[issueSource][0]=snippet) or by reading a CSV export.
-  2. Join each issue to its snippet matches (from walk_all.py's snippet_matches_all.json) by
-     package identity, exactly like correlate_issues.py.
-  3. FINAL FILTER (walk_all's logic): drop every `import_only` match, then keep the issue only
-     if a surviving match's `loc_contig` (longest run of consecutive matched lines, imports
-     removed) falls in [--min-contig, --max-contig]. This is the LoC-contig refinement that
-     surfaces genuine copied logic rather than boilerplate import duplication.
-  4. Emit a JSON payload -- one entry per kept issue -- for a downstream Jira ticket creator:
-     package name+version, a package description, the licensing-issue description, snippet
-     metadata (loc_contig, match%, sample paths, snippetIds), the FOSSA link, and timestamps.
+For every snippet licensing issue (the same request the FOSSA UI makes: category=licensing,
+status=active, scope[type]=global, filter[issueSource][0]=snippet) the script:
+  1. reads the issue's revisionId + analysisSnippetId,
+  2. GET /revisions/{rev}/snippets/{id}      -> the matched file path(s) + package/purl/version,
+  3. GET /revisions/{rev}/snippets/{id}/matches/{path} -> the highlighted matched lines,
+  4. FINAL FILTER (walk_all's import logic, inlined below): drop the match if every non-blank
+     highlighted line is an import/include/require statement, then keep the issue only if a
+     surviving match's loc_contig (longest run of CONSECUTIVE matched lines, imports removed)
+     falls in [--min-contig, --max-contig].
 
-The import classification and loc_contig live in snippet_matches_all.json already (walk_all.py
-computes `import_only` for every match regardless of flags, and `loc_contig` with imports
-removed by default), so this script reuses that logic directly rather than re-deriving it.
+`--min-contig` is the refinement dial: raise it to surface longer, higher-confidence copied
+blocks and leave boilerplate import duplication behind.
+
+One JSON ticket == one snippet match to a package. Because FOSSA opens a separate issue per
+flagged license, a package flagged under several licenses is collapsed into ONE ticket whose
+`flaggedLicenses` lists them all (rather than emitting a near-duplicate ticket per license).
+Each ticket carries the package name+version, package description, the flagged-license list,
+snippet metadata, the FOSSA links, and timestamps for a downstream Jira creator.
 
 Usage:
   export FOSSA_API_KEY=<token>
-  python3 snippet_issues_to_jira.py                       # live fetch, default filter
-  python3 snippet_issues_to_jira.py --min-contig 10       # tighter true-positive threshold
-  python3 snippet_issues_to_jira.py --issues-csv CSV_Licensing_ISSUES_*.csv   # offline
+  python3 snippet_issues_to_jira.py                    # every snippet issue, default filter
+  python3 snippet_issues_to_jira.py --min-contig 10    # tighter true-positive threshold
+  python3 snippet_issues_to_jira.py --limit 50         # quick test on the first 50 issues
 See README_jira.md for every configurable knob.
 """
-import os, sys, csv, json, argparse, urllib.parse, urllib.request, urllib.error, time
-from collections import defaultdict
+import os, sys, json, re, argparse, urllib.parse, urllib.request, urllib.error, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-
-# Reuse the package-identity normalizers from the existing correlation tool (no import-time
-# side effects), so issue<->snippet joins behave identically here and in correlate_issues.py.
-from correlate_issues import norm_locator, norm_purl
 
 BASE_DEFAULT = 'https://app.fossa.com/api'
 APP_BASE = 'https://app.fossa.com'
 
+# The live endpoint returns machine `type` values; map the common ones to the human labels the
+# FOSSA UI/CSV use (unknown values pass through unchanged).
+TYPE_LABEL = {'policy_flag': 'Flagged', 'policy_conflict': 'Flagged',
+              'unlicensed': 'Unlicensed', 'unlicensed_dependency': 'Unlicensed'}
+
 
 # --------------------------------------------------------------------------------------------
-# Issue collection
+# Import-statement filter (ported verbatim from walk_all.py so classification is identical).
+# A match is "import only" when every non-blank highlighted line is a pure import/include/
+# require statement -- boilerplate duplication rather than copied logic. Import lines are also
+# removed before measuring the contiguous block, so loc_contig reflects real copied code.
 # --------------------------------------------------------------------------------------------
-def _get(url, key, retries=4):
+_IMPORT_PATTERNS = [
+    r'import\b',                              # py/java/js/ts/go/kotlin/scala/swift: import ...
+    r'from\s+[\w./\'"]+\s+import\b',          # python: from x import y
+    r'#\s*include\b',                         # c/c++: #include <...>
+    r'#\s*import\b',                          # objective-c: #import <...>
+    r'require(_relative|_once)?\s*[\(\'"]',   # ruby/php: require(...) / require '...'
+    r'(const|let|var)\s+.*=\s*require\s*\(',  # node: const x = require('...')
+    r'include(_once)?\s*[\(\'"]',             # php: include '...'
+    r'use\s+[\w:\\]',                         # rust/php: use a::b; / use A\B;
+    r'using\s+[\w.]',                         # c#: using System.X;
+    r'extern\s+crate\b',                      # rust: extern crate x;
+    r'export\s+.*\bfrom\s+[\'"]',             # js/ts re-export: export { x } from '...'
+    r'load\s*\(?\s*[\'"]',                    # starlark/bazel/ruby: load("...")
+    r'(_|\.|\w+)?\s*"[^"]*/[^"]*"\s*$',       # go import-block member: _ "github.com/lib/pq"
+]
+_IMPORT_RE = re.compile(r'^\s*(?:' + '|'.join(_IMPORT_PATTERNS) + r')')
+
+
+def is_import_line(line):
+    return bool(_IMPORT_RE.match(line or ''))
+
+
+def is_import_only(highlighted):
+    non_blank = [h for h in highlighted if (h.get('l') or '').strip()]
+    return bool(non_blank) and all(is_import_line(h['l']) for h in non_blank)
+
+
+def contiguous_loc(highlighted, max_gap=1, skip_imports=True):
+    """Longest run of consecutive highlighted line numbers, ignoring blank lines and (when
+    skip_imports) import statements. One contiguous copied block rather than scattered hits."""
+    nums = sorted({h['n'] for h in highlighted
+                   if (h.get('l') or '').strip()
+                   and not (skip_imports and is_import_line(h['l']))})
+    if not nums:
+        return 0
+    best = run = 1
+    for prev, cur in zip(nums, nums[1:]):
+        run = run + 1 if (cur - prev) <= max_gap else 1
+        best = max(best, run)
+    return best
+
+
+# --------------------------------------------------------------------------------------------
+# FOSSA API
+# --------------------------------------------------------------------------------------------
+def log(msg):
+    sys.stderr.write(msg + '\n'); sys.stderr.flush()
+
+
+def get(path, key, base=BASE_DEFAULT, retries=4):
+    url = base + path
     last = None
     for i in range(retries):
         try:
@@ -62,261 +118,241 @@ def _get(url, key, retries=4):
 
 
 def fetch_issues(cfg, key):
-    """Paginate the live FOSSA issues endpoint and return the raw issue objects."""
+    """Paginate the live snippet-issues endpoint and return the raw issue objects."""
     out, page = [], 1
     while True:
         params = {
-            'category': cfg.category,
-            'status': cfg.status,
-            'scope[type]': cfg.scope,
-            'filter[issueSource][0]': cfg.source,
-            'filter[search]': cfg.search,
-            'sort': cfg.sort,
-            'page': page,
-            'count': cfg.count,
+            'category': cfg.category, 'status': cfg.status, 'scope[type]': cfg.scope,
+            'filter[issueSource][0]': cfg.source, 'filter[search]': cfg.search,
+            'sort': cfg.sort, 'page': page, 'count': cfg.count,
         }
-        url = cfg.base_url + '/v2/issues?' + urllib.parse.urlencode(params)
-        d = _get(url, key)
-        # The endpoint returns either {"issues": [...], "total": N} or a bare list.
-        batch = d.get('issues', d) if isinstance(d, dict) else d
+        qp = '/v2/issues?' + urllib.parse.urlencode(params)
+        # The org occasionally answers a burst of requests with an empty 200; retry page 1 a
+        # few times before concluding there really are no issues.
+        batch = get(qp, key, cfg.base_url).get('issues', [])
+        if not batch and page == 1:
+            for _ in range(4):
+                time.sleep(3)
+                batch = get(qp, key, cfg.base_url).get('issues', [])
+                if batch:
+                    break
         if not batch:
             break
         out.extend(batch)
-        total = d.get('total') if isinstance(d, dict) else None
-        log(f"  fetched page {page}: {len(batch)} issues (running total {len(out)}"
-            + (f"/{total}" if total is not None else "") + ")")
-        if len(batch) < cfg.count or (total is not None and len(out) >= total):
+        log(f"  fetched page {page}: {len(batch)} (running total {len(out)})")
+        if len(batch) < cfg.count:
+            break
+        if cfg.limit and len(out) >= cfg.limit:
             break
         page += 1
-    return out
-
-
-def read_issues_csv(path):
-    with open(path, newline='') as f:
-        return list(csv.DictReader(f))
-
-
-# The live endpoint returns machine `type` values; map the common ones to the human labels the
-# CSV export uses (unknown values pass through unchanged).
-TYPE_LABEL = {'policy_flag': 'Flagged', 'policy_conflict': 'Flagged',
-              'unlicensed': 'Unlicensed', 'unlicensed_dependency': 'Unlicensed'}
-
-
-def _first(d, *keys):
-    for k in keys:
-        if isinstance(d, dict) and d.get(k) not in (None, ''):
-            return d[k]
-    return None
+    return out[:cfg.limit] if cfg.limit else out
 
 
 def canon_issue(raw):
-    """Normalize a raw issue to a flat dict of canonical fields, handling BOTH the nested live
-    endpoint shape ({source:{...}, projects:[{...}], analysisSnippetId, ...}) and the flat CSV
-    export columns. `snippetId` (from the live `analysisSnippetId`) is the precise join key to
-    walk_all's matches; the CSV has no such id and joins by package locator instead."""
-    src = raw.get('source') if isinstance(raw, dict) else None
-    projs = raw.get('projects') if isinstance(raw, dict) else None
-    if src is not None or (isinstance(projs, list) and projs):
-        # --- live endpoint (nested) ---
-        p0 = projs[0] if isinstance(projs, list) and projs else {}
-        src = src or {}
-        typ = raw.get('type')
-        return {
-            'issueId': str(_first(raw, 'id', 'issueId') or ''),
-            'type': TYPE_LABEL.get(typ, typ),
-            'license': raw.get('license'),
-            'dependency': _first(src, 'name'),
-            'packageLocator': _first(src, 'id'),
-            'version': _first(src, 'version'),
-            'packageManager': _first(src, 'packageManager'),
-            'snippetId': str(raw['analysisSnippetId']) if raw.get('analysisSnippetId') else None,
-            'project': _first(p0, 'id'),
-            'projectUrl': _first(p0, 'url'),
-            'issueUrl': _first(raw, 'url'),
-            'depth': p0.get('depth'),
-            'usage': None,
-            'details': raw.get('details'),
-            'status': 'active',
-            'policyName': None,
-            'scannedAt': _first(p0, 'scannedAt'),
-            'analyzedAt': _first(p0, 'analyzedAt'),
-            'firstFoundAt': _first(p0, 'firstFoundAt') or _first(raw, 'createdAt'),
-        }
-    # --- CSV export (flat) ---
+    """Flatten the nested live issue into the fields we need."""
+    p0 = (raw.get('projects') or [{}])[0]
+    src = raw.get('source') or {}
+    typ = raw.get('type')
     return {
-        'issueId': _first(raw, 'issueId', 'id'),
-        'type': raw.get('type'),
+        'issueId': str(raw.get('id') or ''),
+        'type': TYPE_LABEL.get(typ, typ),
         'license': raw.get('license'),
-        'dependency': raw.get('dependency'),
-        'packageLocator': raw.get('packageLocator'),
-        'version': raw.get('version'),
-        'packageManager': None,
-        'snippetId': None,
-        'project': raw.get('project'),
-        'projectUrl': raw.get('projectUrl'),
-        'issueUrl': None,
-        'depth': raw.get('depth'),
-        'usage': raw.get('usage'),
         'details': raw.get('details'),
-        'status': raw.get('status'),
-        'policyName': raw.get('policyName'),
-        'scannedAt': raw.get('scannedAt'),
-        'analyzedAt': raw.get('analyzedAt'),
-        'firstFoundAt': _first(raw, 'firstFoundAt', 'createdAt'),
+        'issueUrl': raw.get('url'),
+        'dependency': src.get('name'),
+        'packageLocator': src.get('id'),
+        'version': src.get('version'),
+        'packageManager': src.get('packageManager'),
+        'project': p0.get('id'),
+        'projectUrl': p0.get('url'),
+        'revisionId': p0.get('revisionId'),
+        'depth': p0.get('depth'),
+        'scannedAt': p0.get('scannedAt'),
+        'analyzedAt': p0.get('analyzedAt'),
+        'firstFoundAt': p0.get('firstFoundAt') or raw.get('createdAt'),
+        'snippetId': str(raw['analysisSnippetId']) if raw.get('analysisSnippetId') else None,
+    }
+
+
+def _get_nonempty(path, key, cfg, is_empty, tries=5):
+    """GET with retry when the org answers a burst with a (valid-JSON) empty body. Returns the
+    payload, or None if it stayed empty/errored across all tries (i.e. throttled/unavailable)."""
+    for attempt in range(tries):
+        try:
+            d = get(path, key, cfg.base_url)
+            if not is_empty(d):
+                return d
+        except Exception:
+            pass
+        time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+def enrich(issue, cfg, key):
+    """Fetch the issue's snippet + match detail, classify each matched path in-line, and return
+    the per-path results (loc_contig, import_only, match%) plus authoritative package info.
+    `reason` distinguishes a genuinely match-less snippet ('no_matches') from one we could not
+    classify because the API kept returning empty/throttled responses ('unavailable')."""
+    rev, sid = issue.get('revisionId'), issue.get('snippetId')
+    if not rev or not sid:
+        return {'reason': 'no_snippet_ref', 'matches': []}
+    reve = urllib.parse.quote(rev, safe='')
+    # A real snippet payload has an id. A 404 ("Snippet not found") is genuine and permanent
+    # (~10% of analysisSnippetIds are stale) -> don't retry it. An empty/throttled body has no
+    # id -> retry before giving up.
+    snip = None
+    for attempt in range(5):
+        try:
+            d = get(f'/revisions/{reve}/snippets/{sid}', key, cfg.base_url)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return {'reason': 'snippet_not_found', 'matches': []}
+            d = None
+        except Exception:
+            d = None
+        cand = ((d or {}).get('snippet') or {})
+        if cand.get('id'):
+            snip = cand; break
+        time.sleep(1.5 * (attempt + 1))
+    if snip is None:
+        return {'reason': 'unavailable', 'matches': []}
+    paths = [m['path'] for m in (snip.get('matches') or []) if m.get('path')][:cfg.max_paths]
+    if not paths:
+        return {'reason': 'no_matches', 'package': snip.get('package'), 'purl': snip.get('purl'),
+                'version': snip.get('version'), 'matches': []}
+    skip_imports = not cfg.keep_imports
+    matches = []
+    for path in paths:
+        md = _get_nonempty(
+            f'/revisions/{reve}/snippets/{sid}/matches/{urllib.parse.quote(path, safe="")}',
+            key, cfg, lambda d: 'matchDetails' not in (d or {}))
+        if md is None:
+            continue
+        det = md.get('matchDetails', {})
+        hi_d = [c for c in (det.get('detectedCode') or []) if c.get('isHighlighted')]
+        hi_r = [c for c in (det.get('referenceCode') or []) if c.get('isHighlighted')]
+        det_hl = [{'n': c['lineNumber'], 'l': c['line']} for c in hi_d]
+        ref_hl = [{'n': c['lineNumber'], 'l': c['line']} for c in hi_r]
+        # FOSSA often returns an empty detectedCode while referenceCode is populated; classify
+        # on whichever side actually has the matched lines.
+        basis = det_hl if det_hl else ref_hl
+        matches.append({
+            'path': path,
+            'match_pct': det.get('matchPercentage'),
+            'loc_contig': contiguous_loc(basis, cfg.max_gap, skip_imports),
+            'import_only': is_import_only(basis),
+            'used_reference': (not det_hl) and bool(ref_hl),
+        })
+    return {
+        'package': snip.get('package') or issue.get('dependency'),
+        'purl': snip.get('purl'),
+        'version': snip.get('version') or issue.get('version'),
+        'matches': matches,
     }
 
 
 # --------------------------------------------------------------------------------------------
-# Snippet join (walk_all.py output)
+# Payload assembly. One ticket == one snippet match to a package. A package is often flagged
+# under several licenses (FOSSA opens one issue per license), so those are collapsed into a
+# single ticket that lists every flagged license rather than emitting a near-duplicate per one.
 # --------------------------------------------------------------------------------------------
-def load_snippet_index(path):
-    """Index walk_all's matches for joining: by snippetId (the precise key) and by package
-    identity (the CSV fallback). Every match already carries import_only + loc_contig."""
-    d = json.load(open(path))
-    rows = d.get('all_matches') or d.get('matches_in_range') or []
-    by_snip, by_ver, by_name = defaultdict(list), defaultdict(list), defaultdict(list)
-    for m in rows:
-        if m.get('snippetId') is not None:
-            by_snip[str(m['snippetId'])].append(m)
-        k = norm_purl(m.get('purl'))
-        if k:
-            by_ver[k].append(m)
-            by_name[(k[0], k[1])].append(m)
-    return (by_snip, by_ver, by_name), len(rows)
+def issue_url(issue):
+    iid = issue.get('issueId')
+    return issue.get('issueUrl') or (f"{APP_BASE}/issues/licensing/{iid}" if iid else None)
 
 
-def matches_for_issue(issue, idx):
-    """The snippet matches behind this issue. Prefer the exact join on snippetId (live issues
-    carry analysisSnippetId); fall back to package identity for CSV issues that have no id.
-    snippetId is reused across files, so narrow to the issue's own project when possible."""
-    by_snip, by_ver, by_name = idx
-    sid = issue.get('snippetId')
-    if sid and sid in by_snip:
-        cand = by_snip[sid]
-        same_proj = [m for m in cand if m.get('project') == issue.get('project')]
-        return (same_proj or cand), 'snippetId'
-    k = norm_locator(issue.get('packageLocator'))
-    if k:
-        if k in by_ver:
-            return by_ver[k], 'version'
-        if (k[0], k[1]) in by_name:
-            return by_name[(k[0], k[1])], 'name'
-    return [], 'none'
-
-
-# --------------------------------------------------------------------------------------------
-# Payload assembly
-# --------------------------------------------------------------------------------------------
-def package_description(issue):
-    k = norm_locator(issue.get('packageLocator'))
-    eco = issue.get('packageManager') or (k[0] if k else 'unknown ecosystem')
-    name = issue.get('dependency') or (k[1] if k else '') or issue.get('packageLocator') or 'unknown package'
-    ver = issue.get('version') or 'unspecified version'
-    bits = [f"{name} ({eco}) at version {ver}."]
-    if issue.get('depth') is not None:
-        bits.append(f"Dependency depth {issue['depth']}, {issue.get('usage') or 'unknown'} usage.")
-    if issue.get('packageLocator'):
-        bits.append(f"FOSSA locator: {issue['packageLocator']}.")
+def package_description(rep, pkg_name, pkg_ver):
+    eco = rep.get('packageManager') or 'unknown ecosystem'
+    bits = [f"{pkg_name or 'unknown package'} ({eco}) at version {pkg_ver or 'unspecified version'}."]
+    if rep.get('depth') is not None:
+        bits.append(f"Dependency depth {rep['depth']}.")
+    if rep.get('packageLocator'):
+        bits.append(f"FOSSA locator: {rep['packageLocator']}.")
     return ' '.join(bits)
 
 
-def issue_description(issue):
-    typ = issue.get('type') or 'Licensing issue'
-    lic = issue.get('license')
-    head = f"{typ}" + (f" under license {lic}" if lic else "") + "."
-    details = (issue.get('details') or '').strip()
-    parts = [head]
-    if details:
-        parts.append(details)
-    if issue.get('policyName'):
-        parts.append(f"Policy: {issue['policyName']}.")
-    return ' '.join(parts)
-
-
-def fossa_link(issue):
-    # The live endpoint gives a real issue-detail URL; otherwise build one from the id. The
-    # project URL is the fallback link (all the CSV export carries).
-    iid = issue.get('issueId')
-    issue_url = issue.get('issueUrl') or (f"{APP_BASE}/issues/licensing/{iid}" if iid else None)
-    return issue_url or issue.get('projectUrl'), issue_url
-
-
 def snippet_metadata(considered):
-    """Summarize the surviving (non-import, in-range) snippet matches for the ticket."""
-    locs = [m['loc_contig'] for m in considered if isinstance(m.get('loc_contig'), int)]
-    pcts = [m['matchPercentage'] for m in considered if isinstance(m.get('matchPercentage'), (int, float))]
+    locs = [m['loc_contig'] for m in considered]
+    pcts = [m['match_pct'] for m in considered if isinstance(m.get('match_pct'), (int, float))]
     paths = sorted({m['path'] for m in considered if m.get('path')})
-    projects = sorted({m['project'] for m in considered if m.get('project')})
-    snip_ids = sorted({str(m['snippetId']) for m in considered if m.get('snippetId')})
-    sample = considered[0] if considered else {}
     return {
         'n_matches': len(considered),
         'max_loc_contig': max(locs) if locs else 0,
         'sum_loc_contig': sum(locs) if locs else 0,
         'best_match_pct': max(pcts) if pcts else None,
-        'attributed_package': sample.get('package'),
-        'attributed_purl': sample.get('purl'),
         'sample_paths': paths[:10],
         'n_paths': len(paths),
-        'projects': projects,
-        'snippetIds': snip_ids[:25],
+        'used_reference_fallback': any(m.get('used_reference') for m in considered),
     }
 
 
-def build_ticket(issue, considered, strength, generated_at):
-    link, issue_url = fossa_link(issue)
+def build_ticket(group_issues, enr_pkg, considered, generated_at):
+    """group_issues: the issues (one per flagged license) for a single package match.
+    enr_pkg: package info from a successful snippet enrichment. considered: the surviving
+    (non-import, in-range) snippet matches for the package."""
+    rep = group_issues[0]
+    name = (enr_pkg or {}).get('package') or rep.get('dependency')
+    ver = (enr_pkg or {}).get('version') or rep.get('version')
+
+    # One entry per distinct flagged license, strongest concern first isn't meaningful here so
+    # sort alphabetically for stable output.
+    seen, licenses = set(), []
+    for it in sorted(group_issues, key=lambda x: (x.get('license') or '')):
+        lic = it.get('license')
+        if lic in seen:
+            continue
+        seen.add(lic)
+        licenses.append({
+            'license': lic,
+            'type': it.get('type'),
+            'issueId': it.get('issueId'),
+            'fossaIssueLink': issue_url(it),
+            'details': (it.get('details') or '').strip() or None,
+        })
+
+    lic_names = [l['license'] or 'no license' for l in licenses]
+    shown = ', '.join(lic_names[:3]) + (f" +{len(lic_names) - 3} more" if len(lic_names) > 3 else '')
+    first_found = min([i.get('firstFoundAt') for i in group_issues if i.get('firstFoundAt')], default=None)
     return {
-        'summary': (f"Snippet license issue: {issue.get('type') or 'Licensing'}"
-                    f" ({issue.get('license') or 'no license'}) in "
-                    f"{issue.get('dependency') or '?'}@{issue.get('version') or '?'}"),
+        'summary': (f"Snippet copy of {name or '?'}@{ver or '?'} flagged under "
+                    f"{len(licenses)} license(s): {shown}"),
         'package': {
-            'name': issue.get('dependency'),
-            'version': issue.get('version'),
-            'locator': issue.get('packageLocator'),
-            'description': package_description(issue),
+            'name': name,
+            'version': ver,
+            'purl': (enr_pkg or {}).get('purl'),
+            'locator': rep.get('packageLocator'),
+            'description': package_description(rep, name, ver),
         },
-        'licenseIssue': {
-            'issueId': issue.get('issueId'),
-            'type': issue.get('type'),
-            'license': issue.get('license'),
-            'status': issue.get('status'),
-            'policyName': issue.get('policyName'),
-            'description': issue_description(issue),
-        },
-        'snippet': {**snippet_metadata(considered), 'match_strength': strength},
-        'fossaIssueLink': link,
-        'fossaIssueUrl': issue_url,
-        'fossaProjectUrl': issue.get('projectUrl'),
+        'flaggedLicenses': licenses,
+        'licenseCount': len(licenses),
+        'snippet': snippet_metadata(considered),
+        'fossaProjectUrl': rep.get('projectUrl'),
         'timestamps': {
-            'scannedAt': issue.get('scannedAt'),
-            'analyzedAt': issue.get('analyzedAt'),
-            'firstFoundAt': issue.get('firstFoundAt'),
+            'scannedAt': rep.get('scannedAt'),
+            'analyzedAt': rep.get('analyzedAt'),
+            'firstFoundAt': first_found,
             'generatedAt': generated_at,
         },
     }
 
 
 # --------------------------------------------------------------------------------------------
-def log(msg):
-    sys.stderr.write(msg + '\n'); sys.stderr.flush()
-
-
 def parse_config(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--snippets', default='snippet_matches_all.json',
-                   help='walk_all.py JSON dump used for import_only + loc_contig (default: '
-                        'snippet_matches_all.json)')
-    p.add_argument('--issues-csv', default=None,
-                   help='read issues from this FOSSA CSV export instead of the live endpoint')
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--min-contig', type=int, default=1,
                    help='keep an issue only if a non-import match has loc_contig >= N '
                         '(default 1; raise to refine toward longer true-positive blocks)')
     p.add_argument('--max-contig', type=int, default=None,
                    help='keep an issue only if a non-import match has loc_contig <= N (default: no cap)')
     p.add_argument('--keep-imports', action='store_true',
-                   help='disable the final import filter (consider import_only matches too)')
-    p.add_argument('--keep-unmatched', action='store_true',
-                   help='also keep issues with no snippet match in the JSON (null snippet metadata)')
+                   help='disable the final import filter (import-only matches count too)')
+    p.add_argument('--max-gap', type=int, default=1,
+                   help='line-number gap still treated as contiguous (default 1 = strictly consecutive)')
+    p.add_argument('--workers', type=int, default=16, help='concurrent API requests (default 16)')
+    p.add_argument('--max-paths', type=int, default=25,
+                   help='max matched paths to classify per snippet (default 25)')
+    p.add_argument('--limit', type=int, default=None, help='only process the first N issues (for testing)')
     # live endpoint query params (mirror the FOSSA UI request)
     p.add_argument('--category', default='licensing')
     p.add_argument('--status', default='active')
@@ -334,82 +370,131 @@ def main(argv=None):
     cfg = parse_config(argv)
     generated_at = datetime.now(timezone.utc).isoformat()
 
-    if not os.path.exists(cfg.snippets):
-        log(f"ERROR: snippet dump not found: {cfg.snippets} (run walk_all.py first)"); sys.exit(1)
-    idx, n_snip = load_snippet_index(cfg.snippets)
-    log(f"snippet matches indexed: {n_snip}")
+    key = os.environ.get('FOSSA_API_KEY')
+    if not key:
+        log("ERROR: FOSSA_API_KEY not set"); sys.exit(1)
 
-    # Source the issues.
-    if cfg.issues_csv:
-        raw_issues = read_issues_csv(cfg.issues_csv)
-        log(f"issues from CSV {cfg.issues_csv}: {len(raw_issues)}")
-    else:
-        key = os.environ.get('FOSSA_API_KEY')
-        if not key:
-            log("ERROR: FOSSA_API_KEY not set (needed for live fetch; or pass --issues-csv)"); sys.exit(1)
-        log(f"fetching issues: category={cfg.category} status={cfg.status} "
-            f"scope[type]={cfg.scope} filter[issueSource][0]={cfg.source}")
-        raw_issues = fetch_issues(cfg, key)
-        log(f"issues fetched: {len(raw_issues)}")
+    log(f"fetching issues: category={cfg.category} status={cfg.status} "
+        f"scope[type]={cfg.scope} filter[issueSource][0]={cfg.source}")
+    raw_issues = fetch_issues(cfg, key)
+    issues = [canon_issue(r) for r in raw_issues]
+    log(f"issues fetched: {len(issues)}")
+    if not issues:
+        log("no issues returned (org may be throttling; re-run in a moment)")
+
+    # A package flagged under several licenses yields several issues that share one snippet match
+    # (same revision + analysisSnippetId). Enrich each DISTINCT snippet once, keyed by that pair.
+    snip_keys = {}
+    for iss in issues:
+        k = (iss.get('revisionId'), iss.get('snippetId'))
+        snip_keys.setdefault(k, iss)
+    log(f"distinct snippets to classify: {len(snip_keys)} (from {len(issues)} issues)")
+
+    enr_by_key = {}
+    done = 0
+    with ThreadPoolExecutor(max_workers=cfg.workers) as ex:
+        futs = {ex.submit(enrich, rep, cfg, key): k for k, rep in snip_keys.items()}
+        for fut in as_completed(futs):
+            k = futs[fut]
+            done += 1
+            if done % 100 == 0 or done == len(snip_keys):
+                log(f"  classified {done}/{len(snip_keys)}")
+            try:
+                enr_by_key[k] = fut.result()
+            except Exception as e:
+                enr_by_key[k] = {'reason': f'enrich_err:{e}', 'matches': []}
+
+    # Cleanup pass: retry throttled ('unavailable') snippets SEQUENTIALLY, which sidesteps the
+    # burst-based throttling. 'snippet_not_found' (a permanent 404) is NOT retried.
+    for rnd in range(2):
+        stragglers = [k for k, e in enr_by_key.items()
+                      if not e.get('matches') and e.get('reason') == 'unavailable']
+        if not stragglers:
+            break
+        log(f"  cleanup pass {rnd + 1}: retrying {len(stragglers)} throttled snippets sequentially")
+        for k in stragglers:
+            enr_by_key[k] = enrich(snip_keys[k], cfg, key)
 
     hi = cfg.max_contig if cfg.max_contig is not None else 10 ** 9
     lo = cfg.min_contig
 
-    tickets = []
-    n_no_match = n_all_import = n_below = 0
-    for raw in raw_issues:
-        issue = canon_issue(raw)
-        matches, strength = matches_for_issue(issue, idx)
+    # Group issues into one ticket per package match (same package locator + project).
+    groups = {}
+    for iss in issues:
+        gk = (iss.get('packageLocator'), iss.get('projectUrl'))
+        g = groups.setdefault(gk, {'issues': [], 'keys': []})
+        g['issues'].append(iss)
+        mk = (iss.get('revisionId'), iss.get('snippetId'))
+        if mk not in g['keys']:
+            g['keys'].append(mk)
+
+    tickets, unclassified = [], []
+    n_no_match = n_all_import = n_below = n_unavailable = n_not_found = 0
+    for gk, g in groups.items():
+        matches, enr_pkg, reasons = [], None, set()
+        for mk in g['keys']:
+            enr = enr_by_key.get(mk, {'reason': 'unavailable', 'matches': []})
+            reasons.add(enr.get('reason'))
+            if enr.get('purl') and enr_pkg is None:
+                enr_pkg = enr
+            matches.extend(enr.get('matches') or [])
 
         if not matches:
-            n_no_match += 1
-            if cfg.keep_unmatched:
-                tickets.append(build_ticket(issue, [], 'none', generated_at))
+            # No classifiable snippet for the whole package -> attribute to the clearest reason.
+            if 'unavailable' in reasons:
+                n_unavailable += 1
+                unclassified.append({'packageLocator': gk[0], 'projectUrl': gk[1],
+                                     'reason': 'unavailable',
+                                     'issueIds': [i.get('issueId') for i in g['issues']]})
+            elif 'snippet_not_found' in reasons:
+                n_not_found += 1
+            else:
+                n_no_match += 1
             continue
 
         # FINAL FILTER (walk_all's import logic): drop import_only matches unless --keep-imports.
-        pool = matches if cfg.keep_imports else [m for m in matches if not m.get('import_only')]
+        pool = matches if cfg.keep_imports else [m for m in matches if not m['import_only']]
         if not pool:
             n_all_import += 1
             continue
-
-        # LoC-contig refinement: keep only matches whose contiguous block is in range.
-        considered = [m for m in pool if lo <= (m.get('loc_contig') or 0) <= hi]
+        # LoC-contig refinement.
+        considered = [m for m in pool if lo <= m['loc_contig'] <= hi]
         if not considered:
             n_below += 1
             continue
+        tickets.append(build_ticket(g['issues'], enr_pkg, considered, generated_at))
 
-        tickets.append(build_ticket(issue, considered, strength, generated_at))
-
-    # Strongest signal first: longest contiguous block, then best match%.
-    tickets.sort(key=lambda t: (-(t['snippet'].get('max_loc_contig') or 0),
-                                -(t['snippet'].get('best_match_pct') or 0)))
+    tickets.sort(key=lambda t: (-(t['snippet']['max_loc_contig'] or 0),
+                                -(t['snippet']['best_match_pct'] or 0)))
 
     payload = {
         'generatedAt': generated_at,
-        'source': 'csv:' + cfg.issues_csv if cfg.issues_csv else 'live:' + cfg.base_url,
-        'filter': {
-            'import_filter': 'off (--keep-imports)' if cfg.keep_imports else 'on',
-            'min_contig': lo, 'max_contig': cfg.max_contig,
-            'keep_unmatched': cfg.keep_unmatched,
-        },
-        'counts': {
-            'issues_in': len(raw_issues), 'tickets_out': len(tickets),
-            'dropped_no_snippet_match': n_no_match,
-            'dropped_all_imports': n_all_import,
-            'dropped_below_loc_contig': n_below,
-        },
+        'source': cfg.base_url,
+        'grouping': 'one ticket per package match; flaggedLicenses lists all flagged licenses',
+        'filter': {'import_filter': 'off (--keep-imports)' if cfg.keep_imports else 'on',
+                   'min_contig': lo, 'max_contig': cfg.max_contig, 'max_gap': cfg.max_gap},
+        'counts': {'issues_in': len(issues), 'packages_in': len(groups),
+                   'tickets_out': len(tickets),
+                   'licenses_in_tickets': sum(t['licenseCount'] for t in tickets),
+                   'dropped_no_snippet_match': n_no_match,
+                   'dropped_snippet_not_found': n_not_found,
+                   'dropped_all_imports': n_all_import,
+                   'dropped_below_loc_contig': n_below,
+                   'unclassified_unavailable': n_unavailable},
+        'unclassified': unclassified,
         'tickets': tickets,
     }
     with open(cfg.out, 'w') as f:
         json.dump(payload, f, indent=2)
 
-    log(f"\nissues in:                    {len(raw_issues)}")
-    log(f"dropped (no snippet match):   {n_no_match}"
-        + (" [kept as unmatched]" if cfg.keep_unmatched else ""))
+    log(f"\nissues in:                    {len(issues)}  (packages: {len(groups)})")
+    log(f"dropped (no snippet match):   {n_no_match}")
+    log(f"dropped (snippet not found):  {n_not_found}")
     log(f"dropped (all import-only):    {n_all_import}")
     log(f"dropped (below loc_contig):   {n_below}")
-    log(f"JIRA TICKETS:                 {len(tickets)}")
+    if n_unavailable:
+        log(f"UNCLASSIFIED (throttled):     {n_unavailable} packages  (listed under 'unclassified'; re-run to top up)")
+    log(f"JIRA TICKETS (per package):   {len(tickets)}  covering {sum(t['licenseCount'] for t in tickets)} license flags")
     log(f"wrote: {cfg.out}")
 
 
