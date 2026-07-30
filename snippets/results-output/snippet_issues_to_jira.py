@@ -148,12 +148,53 @@ def fetch_issues(cfg, key):
     return out[:cfg.limit] if cfg.limit else out
 
 
+def fetch_project_labels(cfg, key):
+    """{project locator: [label, ...]} for the whole org in ONE call. `/organizations/labels` is
+    label-major (each label lists its projects), so invert it. Labels are decoration -- if the
+    endpoint is unavailable, return {} and carry on with empty label lists rather than failing."""
+    try:
+        labels = (get('/organizations/labels', key, cfg.base_url) or {}).get('labels') or []
+    except Exception as e:
+        log(f"  WARNING: could not fetch project labels ({e}); continuing without them")
+        return {}
+    by_proj = {}
+    for l in labels:
+        name = l.get('label')
+        if not name:
+            continue
+        for p in (l.get('projects') or []):
+            loc = p.get('locator')
+            if loc:
+                by_proj.setdefault(loc, set()).add(name)
+    out = {loc: sorted(names) for loc, names in by_proj.items()}
+    log(f"  project labels: {len(labels)} label(s) across {len(out)} project(s)")
+    return out
+
+
+def canon_project(p):
+    """One entry of the issue's `projects` array -- everything needed to deep-link the snippet."""
+    return {
+        'projectId': p.get('id'),
+        'projectTitle': p.get('title'),
+        'projectUrl': p.get('url'),
+        'branch': p.get('defaultBranch'),
+        'revisionId': p.get('revisionId'),
+        'revisionScanId': p.get('revisionScanId'),
+        'depth': p.get('depth'),
+        'scannedAt': p.get('scannedAt'),
+        'analyzedAt': p.get('analyzedAt'),
+        'firstFoundAt': p.get('firstFoundAt'),
+    }
+
+
 def canon_issue(raw):
-    """Flatten the nested live issue into the fields we need."""
+    """Flatten the nested live issue into the fields we need. `projects` keeps EVERY affected
+    project (an issue commonly spans more than one); p0 stays the representative for grouping."""
     p0 = (raw.get('projects') or [{}])[0]
     src = raw.get('source') or {}
     typ = raw.get('type')
     return {
+        'projects': [canon_project(p) for p in (raw.get('projects') or [])],
         'issueId': str(raw.get('id') or ''),
         'type': TYPE_LABEL.get(typ, typ),
         'license': raw.get('license'),
@@ -261,6 +302,29 @@ def issue_url(issue):
     return issue.get('issueUrl') or (f"{APP_BASE}/issues/licensing/{iid}" if iid else None)
 
 
+def snippet_url(proj, snippet_id, search=None):
+    """Deep link into the FOSSA snippet browser for one project revision, mirroring the URL the
+    UI produces:
+      {projectUrl}/refs/branch/{branch}/{revHash}/browse/snippets/{sid}
+        ?revisionScanId={scanId}&path=%2F&search={pkg}&selectedSnippetId={sid}
+    Every part comes from the issue's own `projects[]` entry -- no extra API call. Returns None if
+    the entry is missing a piece the link can't be built without."""
+    purl, rev = proj.get('projectUrl'), proj.get('revisionId')
+    if not (purl and rev and snippet_id):
+        return None
+    # revisionId is "<project locator>$<revision hash>"; the URL wants just the hash.
+    rev_hash = rev.split('$', 1)[1] if '$' in rev else rev
+    if not rev_hash:
+        return None
+    branch = urllib.parse.quote(proj.get('branch') or 'master', safe='')
+    q = [('revisionScanId', proj.get('revisionScanId')), ('path', '/')]
+    if search:
+        q.append(('search', search))
+    q.append(('selectedSnippetId', snippet_id))
+    qs = urllib.parse.urlencode([(k, v) for k, v in q if v is not None])
+    return f"{purl.rstrip('/')}/refs/branch/{branch}/{rev_hash}/browse/snippets/{snippet_id}?{qs}"
+
+
 def package_description(rep, pkg_name, pkg_ver):
     eco = rep.get('packageManager') or 'unknown ecosystem'
     bits = [f"{pkg_name or 'unknown package'} ({eco}) at version {pkg_ver or 'unspecified version'}."]
@@ -286,10 +350,12 @@ def snippet_metadata(considered):
     }
 
 
-def build_ticket(group_issues, enr_pkg, considered, generated_at):
+def build_ticket(group_issues, enr_pkg, considered, generated_at, labels_by_project=None):
     """group_issues: the issues (one per flagged license) for a single package match.
     enr_pkg: package info from a successful snippet enrichment. considered: the surviving
-    (non-import, in-range) snippet matches for the package."""
+    (non-import, in-range) snippet matches for the package.
+    labels_by_project: {project locator: [label, ...]} from fetch_project_labels."""
+    labels_by_project = labels_by_project or {}
     rep = group_issues[0]
     name = (enr_pkg or {}).get('package') or rep.get('dependency')
     ver = (enr_pkg or {}).get('version') or rep.get('version')
@@ -308,7 +374,38 @@ def build_ticket(group_issues, enr_pkg, considered, generated_at):
             'issueId': it.get('issueId'),
             'fossaIssueLink': issue_url(it),
             'details': (it.get('details') or '').strip() or None,
+            # One snippet deep link per project this specific flagged license affects.
+            'snippetLinks': [{
+                'projectId': p.get('projectId'),
+                'projectTitle': p.get('projectTitle'),
+                'projectUrl': p.get('projectUrl'),
+                'branch': p.get('branch'),
+                'snippetUrl': snippet_url(p, it.get('snippetId'), search=name),
+            } for p in (it.get('projects') or [])],
         })
+
+    # Union of every project affected by any of this package's flagged licenses. An issue often
+    # spans more than one project, and the grouped issues can carry different analysisSnippetIds,
+    # so collect distinct snippet links per project.
+    affected = {}
+    for it in group_issues:
+        for p in (it.get('projects') or []):
+            pid = p.get('projectId')
+            entry = affected.setdefault(pid, {
+                'projectId': pid,
+                'projectTitle': p.get('projectTitle'),
+                'projectUrl': p.get('projectUrl'),
+                'projectLabels': labels_by_project.get(pid, []),
+                'branch': p.get('branch'),
+                'revisionId': p.get('revisionId'),
+                'revisionScanId': p.get('revisionScanId'),
+                'snippetUrls': [],
+            })
+            u = snippet_url(p, it.get('snippetId'), search=name)
+            if u and u not in entry['snippetUrls']:
+                entry['snippetUrls'].append(u)
+    affected_projects = sorted(affected.values(), key=lambda e: (e['projectId'] or ''))
+    project_labels = sorted({l for e in affected_projects for l in e['projectLabels']})
 
     lic_names = [l['license'] or 'no license' for l in licenses]
     shown = ', '.join(lic_names[:3]) + (f" +{len(lic_names) - 3} more" if len(lic_names) > 3 else '')
@@ -326,6 +423,9 @@ def build_ticket(group_issues, enr_pkg, considered, generated_at):
         'flaggedLicenses': licenses,
         'licenseCount': len(licenses),
         'snippet': snippet_metadata(considered),
+        'affectedProjects': affected_projects,
+        'affectedProjectCount': len(affected_projects),
+        'projectLabels': project_labels,
         'fossaProjectUrl': rep.get('projectUrl'),
         'timestamps': {
             'scannedAt': rep.get('scannedAt'),
@@ -379,6 +479,7 @@ def main(argv=None):
     raw_issues = fetch_issues(cfg, key)
     issues = [canon_issue(r) for r in raw_issues]
     log(f"issues fetched: {len(issues)}")
+    labels_by_project = fetch_project_labels(cfg, key)
     if not issues:
         log("no issues returned (org may be throttling; re-run in a moment)")
 
@@ -462,7 +563,8 @@ def main(argv=None):
         if not considered:
             n_below += 1
             continue
-        tickets.append(build_ticket(g['issues'], enr_pkg, considered, generated_at))
+        tickets.append(build_ticket(g['issues'], enr_pkg, considered, generated_at,
+                                    labels_by_project))
 
     tickets.sort(key=lambda t: (-(t['snippet']['max_loc_contig'] or 0),
                                 -(t['snippet']['best_match_pct'] or 0)))

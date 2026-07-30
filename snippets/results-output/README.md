@@ -89,7 +89,8 @@ Environment: `FOSSA_API_KEY` (required).
     "unclassified_unavailable": 0          // API kept returning empty/throttled — see below
   },
   "unclassified": [ { "packageLocator": "...", "reason": "unavailable", "issueIds": ["..."] } ],
-  "tickets": [ /* one entry per package match, strongest signal first */ ]
+  "tickets": [ /* one entry per package match, strongest signal first; each carries
+                  affectedProjects[] with per-project snippet deep links + projectLabels */ ]
 }
 ```
 
@@ -100,14 +101,56 @@ Each ticket (one per package match):
 | `summary` | Ready-to-use Jira title, e.g. `Snippet copy of GovPay@3.8.0 flagged under 10 license(s): CDDL-1.1, EPL-2.0, GPL-2.0-only +7 more`. |
 | `package.name` / `package.version` / `package.purl` / `package.locator` | Package identity (from the snippet detail). |
 | `package.description` | Human sentence: name, ecosystem, version, dependency depth, FOSSA locator. |
-| `flaggedLicenses` | **The N flagged licenses for this package**, each `{license, type, issueId, fossaIssueLink, details}`. `details` is FOSSA's obligation note for that license. |
+| `flaggedLicenses` | **The N flagged licenses for this package**, each `{license, type, issueId, fossaIssueLink, details, snippetLinks}`. `details` is FOSSA's obligation note for that license; `snippetLinks` is one snippet deep link per project *that license* affects. |
 | `licenseCount` | Number of flagged licenses (length of `flaggedLicenses`). |
 | `snippet` | `max_loc_contig`, `sum_loc_contig`, `best_match_pct`, `n_matches`, `sample_paths`, `n_paths`, `used_reference_fallback`. |
-| `fossaProjectUrl` | The project link (per-license issue links live in `flaggedLicenses`). |
+| `affectedProjects` | **Every project affected by any of this package's flagged licenses** — see below. |
+| `affectedProjectCount` | Length of `affectedProjects`. |
+| `projectLabels` | Union of the FOSSA project labels across `affectedProjects` (e.g. `["PRODUCT A", "BACKEND"]`). |
+| `fossaProjectUrl` | The representative project link, kept for backwards compatibility. Prefer `affectedProjects`. |
 | `timestamps` | `scannedAt`, `analyzedAt`, `firstFoundAt` (earliest across the grouped issues) + `generatedAt` (this run, UTC). |
 
 `type` is mapped to the human label (e.g. `policy_flag` → `Flagged`, `unlicensed_dependency` →
 `Unlicensed`).
+
+## Affected projects, snippet links & labels
+
+A single FOSSA issue frequently affects **more than one project** (in testing, 177 of 1681 issues
+listed two). `affectedProjects` carries them all, each with a deep link straight into the snippet
+browser for that project's revision:
+
+```jsonc
+"affectedProjects": [
+  {
+    "projectId": "custom+123/github.com/platform/backendproject",
+    "projectTitle": "https://github.com/platform/backendproject.git",
+    "projectUrl": "https://app.fossa.com/projects/custom%2B123%2F...%2Fbackendproject",
+    "projectLabels": ["PRODUCT A", "BACKEND"],
+    "branch": "release-1",
+    "revisionId": "custom+123/github.com/platform/backendproject$abc1234...",
+    "revisionScanId": 9876543,
+    "snippetUrls": ["https://app.fossa.com/projects/.../browse/snippets/456789?..."]
+  }
+]
+```
+
+`snippetUrls` is a list because the issues grouped into one ticket can carry different
+`analysisSnippetId`s for the same package (e.g. `sourceforge+jnode$latest` has three).
+
+The snippet URL is assembled from the issue's own `projects[]` entry — **no extra API call**:
+
+```
+{projectUrl}/refs/branch/{defaultBranch}/{revisionHash}/browse/snippets/{analysisSnippetId}
+  ?revisionScanId={revisionScanId}&path=%2F&search={packageName}&selectedSnippetId={analysisSnippetId}
+```
+
+`revisionHash` is the part of `revisionId` after the `$`. `search` is set to the package name to
+pre-filter the browser's dependency list the way the UI does; it is a display filter only — strip
+it from the URL if you would rather see the unfiltered snippet list.
+
+**Project labels** come from one `GET /organizations/labels` call (label-major, inverted to
+project-major in the script). Labels are decoration: if that endpoint fails the run logs a warning
+and continues with empty `projectLabels` rather than aborting.
 
 ## Rate limiting & the `unclassified` list
 
