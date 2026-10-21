@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Self-contained: paginate FOSSA snippet licensing issues, classify each issue's snippet
-in-line (import-statement filter + contiguous-LoC), and emit a Jira-ready JSON payload of the
-true-positive copied blocks. No dependency on walk_all.py or any pre-built snippet dump.
+in-line (properties-file filter + import-statement filter + contiguous-LoC), and emit a
+Jira-ready JSON payload of the true-positive copied blocks. No dependency on walk_all.py or any
+pre-built snippet dump.
 
 For every snippet licensing issue (the same request the FOSSA UI makes: category=licensing,
 status=active, scope[type]=global, filter[issueSource][0]=snippet) the script:
   1. reads the issue's revisionId + analysisSnippetId,
   2. GET /revisions/{rev}/snippets/{id}      -> the matched file path(s) + package/purl/version,
   3. GET /revisions/{rev}/snippets/{id}/matches/{path} -> the highlighted matched lines,
-  4. FINAL FILTER (walk_all's import logic, inlined below): drop the match if every non-blank
-     highlighted line is an import/include/require statement, then keep the issue only if a
-     surviving match's loc_contig (longest run of CONSECUTIVE matched lines, imports removed)
-     falls in [--min-contig, --max-contig].
+  4. FINAL FILTER: drop the match if the matched file is a .properties file (key=value config,
+     not copied code; its match details aren't even fetched), drop it if every non-blank
+     highlighted line is an import/include/require statement (walk_all's import logic, inlined
+     below), then keep the issue only if a surviving match's loc_contig (longest run of
+     CONSECUTIVE matched lines, imports removed) falls in [--min-contig, --max-contig].
 
 `--min-contig` is the refinement dial: raise it to surface longer, higher-confidence copied
 blocks and leave boilerplate import duplication behind.
@@ -88,6 +90,18 @@ def contiguous_loc(highlighted, max_gap=1, skip_imports=True):
         run = run + 1 if (cur - prev) <= max_gap else 1
         best = max(best, run)
     return best
+
+
+# --------------------------------------------------------------------------------------------
+# Properties-file filter. A match whose file is a .properties file (Java/Spring key=value config,
+# message bundles) is shared configuration boilerplate rather than copied logic, so it is
+# dropped the same way an import-only match is.
+# --------------------------------------------------------------------------------------------
+_PROPERTIES_EXTS = ('.properties',)
+
+
+def is_properties_file(path):
+    return (path or '').lower().endswith(_PROPERTIES_EXTS)
 
 
 # --------------------------------------------------------------------------------------------
@@ -264,6 +278,12 @@ def enrich(issue, cfg, key):
     skip_imports = not cfg.keep_imports
     matches = []
     for path in paths:
+        if not cfg.keep_properties and is_properties_file(path):
+            # Dropped by the final filter regardless of its lines, so skip the match-detail call.
+            matches.append({'path': path, 'match_pct': None, 'loc_contig': 0,
+                            'import_only': False, 'properties_file': True,
+                            'used_reference': False})
+            continue
         md = _get_nonempty(
             f'/revisions/{reve}/snippets/{sid}/matches/{urllib.parse.quote(path, safe="")}',
             key, cfg, lambda d: 'matchDetails' not in (d or {}))
@@ -282,6 +302,7 @@ def enrich(issue, cfg, key):
             'match_pct': det.get('matchPercentage'),
             'loc_contig': contiguous_loc(basis, cfg.max_gap, skip_imports),
             'import_only': is_import_only(basis),
+            'properties_file': is_properties_file(path),
             'used_reference': (not det_hl) and bool(ref_hl),
         })
     return {
@@ -447,6 +468,8 @@ def parse_config(argv=None):
                    help='keep an issue only if a non-import match has loc_contig <= N (default: no cap)')
     p.add_argument('--keep-imports', action='store_true',
                    help='disable the final import filter (import-only matches count too)')
+    p.add_argument('--keep-properties', action='store_true',
+                   help='disable the properties-file filter (matches to .properties files count too)')
     p.add_argument('--max-gap', type=int, default=1,
                    help='line-number gap still treated as contiguous (default 1 = strictly consecutive)')
     p.add_argument('--workers', type=int, default=16, help='concurrent API requests (default 16)')
@@ -530,7 +553,7 @@ def main(argv=None):
             g['keys'].append(mk)
 
     tickets, unclassified = [], []
-    n_no_match = n_all_import = n_below = n_unavailable = n_not_found = 0
+    n_no_match = n_all_props = n_all_import = n_below = n_unavailable = n_not_found = 0
     for gk, g in groups.items():
         matches, enr_pkg, reasons = [], None, set()
         for mk in g['keys']:
@@ -553,8 +576,13 @@ def main(argv=None):
                 n_no_match += 1
             continue
 
-        # FINAL FILTER (walk_all's import logic): drop import_only matches unless --keep-imports.
-        pool = matches if cfg.keep_imports else [m for m in matches if not m['import_only']]
+        # FINAL FILTER: drop matches to .properties files unless --keep-properties, then
+        # import_only matches (walk_all's import logic) unless --keep-imports.
+        pool = matches if cfg.keep_properties else [m for m in matches if not m.get('properties_file')]
+        if not pool:
+            n_all_props += 1
+            continue
+        pool = pool if cfg.keep_imports else [m for m in pool if not m['import_only']]
         if not pool:
             n_all_import += 1
             continue
@@ -573,13 +601,15 @@ def main(argv=None):
         'generatedAt': generated_at,
         'source': cfg.base_url,
         'grouping': 'one ticket per package match; flaggedLicenses lists all flagged licenses',
-        'filter': {'import_filter': 'off (--keep-imports)' if cfg.keep_imports else 'on',
+        'filter': {'properties_filter': 'off (--keep-properties)' if cfg.keep_properties else 'on',
+                   'import_filter': 'off (--keep-imports)' if cfg.keep_imports else 'on',
                    'min_contig': lo, 'max_contig': cfg.max_contig, 'max_gap': cfg.max_gap},
         'counts': {'issues_in': len(issues), 'packages_in': len(groups),
                    'tickets_out': len(tickets),
                    'licenses_in_tickets': sum(t['licenseCount'] for t in tickets),
                    'dropped_no_snippet_match': n_no_match,
                    'dropped_snippet_not_found': n_not_found,
+                   'dropped_all_properties_files': n_all_props,
                    'dropped_all_imports': n_all_import,
                    'dropped_below_loc_contig': n_below,
                    'unclassified_unavailable': n_unavailable},
@@ -592,6 +622,7 @@ def main(argv=None):
     log(f"\nissues in:                    {len(issues)}  (packages: {len(groups)})")
     log(f"dropped (no snippet match):   {n_no_match}")
     log(f"dropped (snippet not found):  {n_not_found}")
+    log(f"dropped (all .properties):    {n_all_props}")
     log(f"dropped (all import-only):    {n_all_import}")
     log(f"dropped (below loc_contig):   {n_below}")
     if n_unavailable:

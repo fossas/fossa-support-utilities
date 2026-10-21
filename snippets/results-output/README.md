@@ -3,7 +3,8 @@
 ## Overview
 
 **Self-contained, single command.** Paginates FOSSA **snippet licensing issues**, classifies each
-issue's snippet in-line (walk_all's import-statement filter + contiguous-LoC), and writes a JSON
+issue's snippet in-line (properties-file filter + walk_all's import-statement filter +
+contiguous-LoC), and writes a JSON
 payload of the true-positive copied blocks for a downstream Jira-ticket creator. No `walk_all.py`
 run and no pre-built `snippet_matches_all.json` are needed — everything comes from the live API.
 
@@ -15,7 +16,8 @@ collapsed to ~310 tickets — e.g. `GovPay@3.8.0` (10 flagged licenses) is now o
 
 The refinement dial is **`--min-contig`** (the longest run of *consecutive* matched lines with
 imports removed). Raise it to look only at longer, higher-confidence copied blocks and leave
-boilerplate `import` / `#include` / `require` duplication behind.
+boilerplate `import` / `#include` / `require` duplication behind. Matches to `.properties` files
+(key=value configuration, not copied code) are dropped as well.
 
 ## How it works
 
@@ -25,9 +27,13 @@ For every snippet licensing issue (the same request the FOSSA UI makes — `cate
 1. reads the issue's `revisionId` + `analysisSnippetId`;
 2. `GET /revisions/{rev}/snippets/{id}` → the matched file path(s) + package / purl / version;
 3. `GET /revisions/{rev}/snippets/{id}/matches/{path}` → the highlighted matched lines;
-4. **final filter (walk_all's import logic, ported into this script):** drop the match if every
-   non-blank highlighted line is an import statement, then keep the issue only if a surviving
-   match's `loc_contig` is within `[--min-contig, --max-contig]`.
+4. **final filter:**
+   - drop the match if its file is a `.properties` file (Java/Spring config, message bundles).
+     Its match details aren't fetched at all, which also saves an API call;
+   - drop the match if every non-blank highlighted line is an import statement (walk_all's
+     import logic, ported into this script);
+   - keep the issue only if a surviving match's `loc_contig` is within
+     `[--min-contig, --max-contig]`.
 
 When FOSSA returns an empty `detectedCode` (your-code side) it falls back to `referenceCode` (the
 matched upstream lines) for classification, exactly like `walk_all.py`.
@@ -45,6 +51,7 @@ python3 snippet_issues_to_jira.py                    # every snippet issue, defa
 python3 snippet_issues_to_jira.py --min-contig 10    # tighter true-positive threshold
 python3 snippet_issues_to_jira.py --limit 50         # quick test on the first 50 issues
 python3 snippet_issues_to_jira.py --keep-imports     # audit: include import-only matches
+python3 snippet_issues_to_jira.py --keep-properties  # audit: include .properties file matches
 ```
 
 A full org run makes ~2 API calls per issue; expect a few minutes for a couple thousand issues.
@@ -56,6 +63,7 @@ A full org run makes ~2 API calls per issue; expect a few minutes for a couple t
 | `--min-contig N` | `1` | **Main refinement dial.** Keep an issue only if a non-import match has `loc_contig >= N`. Raise it to focus on longer copied blocks. |
 | `--max-contig N` | none | Cap `loc_contig` (e.g. exclude giant vendored files). |
 | `--keep-imports` | off | Disable the final import filter (import-only matches count too). |
+| `--keep-properties` | off | Disable the properties-file filter (matches to `.properties` files count too). |
 | `--max-gap N` | `1` | Line-number gap still treated as contiguous. `1` = strictly consecutive; raise to bridge stray comment/blank lines inside a block. |
 | `--workers N` | `16` | Concurrent API requests. **Lower this (e.g. `--workers 6`) if you see many `unclassified` results** — that means the org is rate-limiting the burst. |
 | `--max-paths N` | `25` | Max matched paths to classify per snippet (snippets almost always have one). |
@@ -76,7 +84,7 @@ Environment: `FOSSA_API_KEY` (required).
   "generatedAt": "2026-07-10T17:01:07Z",
   "source": "https://app.fossa.com/api",
   "grouping": "one ticket per package match; flaggedLicenses lists all flagged licenses",
-  "filter": { "import_filter": "on", "min_contig": 1, "max_contig": null, "max_gap": 1 },
+  "filter": { "properties_filter": "on", "import_filter": "on", "min_contig": 1, "max_contig": null, "max_gap": 1 },
   "counts": {
     "issues_in": 1561,                     // raw licensing issues (one per package per license)
     "packages_in": 310,                    // distinct package matches (the ticket grain)
@@ -84,6 +92,7 @@ Environment: `FOSSA_API_KEY` (required).
     "licenses_in_tickets": 700,            // total license flags carried across tickets
     "dropped_no_snippet_match": 5,         // snippet genuinely has no matched path
     "dropped_snippet_not_found": 40,       // analysisSnippetId 404s (stale snippet, ~10%)
+    "dropped_all_properties_files": 10,    // every matched file was a .properties file
     "dropped_all_imports": 20,             // every matched line was an import statement
     "dropped_below_loc_contig": 25,        // no matched block met --min-contig
     "unclassified_unavailable": 0          // API kept returning empty/throttled — see below
@@ -170,5 +179,6 @@ The other drop buckets are **not** throttling artifacts:
 - `dropped_snippet_not_found` — the issue's `analysisSnippetId` returns `404 Snippet not found`
   (a stale/removed snippet; ~10% of issues). Permanent, so it is not retried.
 - `dropped_no_snippet_match` — the snippet resolved but has no matched path in the revision.
-- `dropped_all_imports` / `dropped_below_loc_contig` — the filter did its job.
+- `dropped_all_properties_files` / `dropped_all_imports` / `dropped_below_loc_contig` — the
+  filter did its job.
 ```
